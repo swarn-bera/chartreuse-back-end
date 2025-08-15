@@ -1,0 +1,18 @@
+services:
+  user-service:
+    build: ./user-service
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./user-service:/app
+    command: sh -c "npx prisma migrate deploy && npx nodemon --legacy-watch src/index.js"
+    environment:
+      - DATABASE_URL=postgresql://postgres:iamEMPEROR@1104@postgres:5432/ChartreuseDB
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ChartreuseDB
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: iamEMPEROR@1104
+    ports:
+      - "5432:5432"
