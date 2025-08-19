@@ -7,3 +7,4 @@ prisma/.env
 .vscode/
 .DS_Store
 Thumbs.db
+/src/generated/prisma
