@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import { fetchAMFIData } from "../utils/amfiFetcher.js";
 import { AMC_WHITELIST, normalizeAMC, detectCategory } from "../config/constants.js";
 import { cagrFromDates, dailyReturns, stddevSample, annualizedVolatilityFromSeries, riskLabelFromVol } from "../utils/metrics.js";
+import { fetchHistoricalNAV } from '../utils/historicalDataFetcher.js';
 
 const prisma = new PrismaClient();
 
@@ -60,7 +61,10 @@ export async function getMutualFunds(_req, res) {
       });
     }
 
-    // Persist to DB when requested
+    // Add persist flag check
+    const persist = _req.query.persist === '1';
+
+    // Persist to DB when requested (for initial setup and daily cron)
     let persisted = 0;
     if (persist) {
       for (const f of result) {
@@ -83,7 +87,7 @@ export async function getMutualFunds(_req, res) {
           // AMFI date is dd-MMM-yyyy; Date(...) handles this format
           const navDate = new Date(f.date);
           await prisma.nAVHistory.upsert({
-            where: { schemeCode_date: { schemeCode: f.schemeCode, date: navDate } }, // requires @@id([schemeCode,date]) or @@unique named schemeCode_date
+            where: { schemeCode_date: { schemeCode: f.schemeCode, date: navDate } },
             update: { nav: f.nav },
             create: { schemeCode: f.schemeCode, date: navDate, nav: f.nav },
           });
@@ -92,7 +96,11 @@ export async function getMutualFunds(_req, res) {
       }
     }
 
-    res.json({ count: result.length, persisted, funds: result });
+    res.json({ 
+      count: result.length, 
+      persisted, 
+      funds: result 
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to fetch mutual fund data" });
@@ -104,126 +112,123 @@ export async function getMutualFunds(_req, res) {
 export async function getFundMetricsAndRating(req, res) {
   const { schemeCode } = req.params;
 
-  // find fund & category
-  const fund = await prisma.mutualFund.findUnique({
-    where: { schemeCode },
-    select: { category: true },
-  });
-  if (!fund) return res.status(404).json({ error: 'Unknown schemeCode' });
-
-  // latest NAV
-  const latest = await prisma.nAVHistory.findFirst({
-    where: { schemeCode },
-    orderBy: { date: 'desc' },
-  });
-  if (!latest) return res.status(404).json({ error: 'No NAV history' });
-
-  const computeCAGR = async (years) => {
-    const tgt = new Date(latest.date);
-    tgt.setFullYear(tgt.getFullYear() - years);
-
-    let start = await prisma.nAVHistory.findFirst({
-      where: { schemeCode, date: { gte: tgt } },
-      orderBy: { date: 'asc' },
-    }) || await prisma.nAVHistory.findFirst({
+  try {
+    // Find fund & category
+    const fund = await prisma.mutualFund.findUnique({
       where: { schemeCode },
-      orderBy: { date: 'asc' },
+      select: { category: true },
     });
-    if (!start) return null;
+    if (!fund) return res.status(404).json({ error: 'Unknown schemeCode' });
 
-    const yearsExact = (latest.date - start.date) / (365 * 24 * 60 * 60 * 1000);
-    return cagrFromDates(start.nav, latest.nav, yearsExact);
-  };
-
-  const [cagr1y, cagr3y] = await Promise.all([computeCAGR(1), computeCAGR(3)]);
-
-  // rating by category using 3Y CAGR
-  let stars = null;
-  if (cagr3y != null) {
-    const peers = await prisma.mutualFund.findMany({
-      where: { category: fund.category },
-      select: { schemeCode: true },
+    // Get latest NAV from our database
+    const latest = await prisma.nAVHistory.findFirst({
+      where: { schemeCode },
+      orderBy: { date: 'desc' },
     });
+    if (!latest) return res.status(404).json({ error: 'No NAV history' });
 
-    const peerCagrs = [];
-    for (const p of peers) {
-      const pLatest = await prisma.nAVHistory.findFirst({
-        where: { schemeCode: p.schemeCode },
-        orderBy: { date: 'desc' },
-      });
-      if (!pLatest) continue;
-
-      const tgt = new Date(pLatest.date);
-      tgt.setFullYear(tgt.getFullYear() - 3);
-
-      let pStart = await prisma.nAVHistory.findFirst({
-        where: { schemeCode: p.schemeCode, date: { gte: tgt } },
-        orderBy: { date: 'asc' },
-      }) || await prisma.nAVHistory.findFirst({
-        where: { schemeCode: p.schemeCode },
-        orderBy: { date: 'asc' },
-      });
-      if (!pStart) continue;
-
-      const yrsExact = (pLatest.date - pStart.date) / (365 * 24 * 60 * 60 * 1000);
-      const pCagr = cagrFromDates(pStart.nav, pLatest.nav, yrsExact);
-      if (pCagr != null) peerCagrs.push(pCagr);
+    // Fetch historical data from mfapi.in for calculations
+    console.log(`Fetching historical data for ${schemeCode}...`);
+    const historicalData = await fetchHistoricalNAV(schemeCode, 1095); // ~3 years
+    
+    if (!historicalData || historicalData.length < 30) {
+      return res.status(400).json({ error: 'Insufficient historical data for calculations' });
     }
 
-    if (peerCagrs.length) {
-      const sorted = peerCagrs.sort((a, b) => a - b);
-      const p = percentileRank(cagr3y, sorted);
-      stars = starsFromPercentile(p);
+    // Calculate CAGR
+    const computeCAGR = (years) => {
+      const targetDate = new Date();
+      targetDate.setFullYear(targetDate.getFullYear() - years);
+      
+      // Find closest date to target
+      const startPoint = historicalData.find(item => 
+        new Date(item.date) <= targetDate
+      ) || historicalData[historicalData.length - 1]; // fallback to oldest
+      
+      const endPoint = historicalData[0]; // most recent
+      const actualYears = (new Date(endPoint.date) - new Date(startPoint.date)) / (365 * 24 * 60 * 60 * 1000);
+      
+      if (actualYears < 0.5) return null; // not enough data
+      
+      return cagrFromDates(startPoint.nav, endPoint.nav, actualYears);
+    };
+
+    const cagr1y = computeCAGR(1);
+    const cagr3y = computeCAGR(3);
+
+    // Calculate rating (simplified - you can enhance this later)
+    let stars = null;
+    if (cagr3y !== null) {
+      // Simple rating based on CAGR thresholds
+      if (cagr3y >= 0.15) stars = 5;      // >15% CAGR
+      else if (cagr3y >= 0.12) stars = 4;  // 12-15% CAGR
+      else if (cagr3y >= 0.10) stars = 3;  // 10-12% CAGR
+      else if (cagr3y >= 0.08) stars = 2;  // 8-10% CAGR
+      else stars = 1;                      // <8% CAGR
     }
+
+    return res.json({
+      schemeCode,
+      category: fund.category,
+      asOfDate: latest.date,
+      cagr: { 
+        y1: cagr1y ? Math.round(cagr1y * 10000) / 100 : null, // percentage with 2 decimals
+        y3: cagr3y ? Math.round(cagr3y * 10000) / 100 : null 
+      },
+      rating: { stars },
+      dataPoints: historicalData.length
+    });
+  } catch (error) {
+    console.error('Error calculating metrics:', error);
+    return res.status(500).json({ error: 'Failed to calculate metrics' });
   }
-
-  return res.json({
-    schemeCode,
-    category: fund.category,
-    asOfDate: latest.date,
-    cagr: { y1: cagr1y, y3: cagr3y },
-    rating: { stars }, // null if not enough data
-  });
 }
 
 export async function getFundRisk(req, res) {
   const { schemeCode } = req.params;
 
-  const latest = await prisma.nAVHistory.findFirst({
-    where: { schemeCode },
-    orderBy: { date: 'desc' },
-  });
+  try {
+    // Get latest NAV from our database for reference
+    const latest = await prisma.nAVHistory.findFirst({
+      where: { schemeCode },
+      orderBy: { date: 'desc' },
+    });
 
-  if (!latest) return res.status(404).json({ error: 'No NAV history for scheme' });
+    if (!latest) return res.status(404).json({ error: 'No NAV history for scheme' });
 
-  const from = new Date(latest.date);
-  from.setDate(from.getDate() - 400); // ~1 year window with cushion
+    // Fetch 1 year of historical data from mfapi.in for volatility calculation
+    console.log(`Fetching historical data for risk calculation: ${schemeCode}...`);
+    const historicalData = await fetchHistoricalNAV(schemeCode, 365); // 1 year
+    
+    if (!historicalData || historicalData.length < 30) {
+      return res.json({
+        schemeCode,
+        asOfDate: latest.date,
+        volAnnual: null,
+        riskLabel: 'Unknown',
+        dataPoints: historicalData?.length || 0,
+      });
+    }
 
-  const series = await prisma.nAVHistory.findMany({
-    where: { schemeCode, date: { gte: from, lte: latest.date } },
-    orderBy: { date: 'asc' },
-    select: { date: true, nav: true },
-  });
+    // Convert to format expected by metrics function
+    const series = historicalData.map(item => ({
+      date: new Date(item.date),
+      nav: item.nav
+    })).reverse(); // reverse to get chronological order (oldest first)
 
-  if (series.length < 30) {
+    // Calculate annualized volatility and risk label
+    const volAnnual = annualizedVolatilityFromSeries(series);   
+    const riskLabel = riskLabelFromVol(volAnnual);
+
     return res.json({
       schemeCode,
       asOfDate: latest.date,
-      volAnnual: null,
-      riskLabel: 'Unknown',
-      days: series.length,
+      volAnnual: volAnnual ? Math.round(volAnnual * 10000) / 100 : null, // percentage with 2 decimals
+      riskLabel,
+      dataPoints: series.length,
     });
+  } catch (error) {
+    console.error('Error calculating risk:', error);
+    return res.status(500).json({ error: 'Failed to calculate risk metrics' });
   }
-
-  // using the daily NAV series for computing the annualized volatility which is used to determine the risk label
-  const volAnnual = annualizedVolatilityFromSeries(series);   
-  const riskLabel = riskLabelFromVol(volAnnual);
-
-  return res.json({
-    schemeCode,
-    asOfDate: latest.date,
-    volAnnual, // 0.17 for 17%
-    riskLabel,
-    days: series.length,
-  });
 }

@@ -12,6 +12,8 @@ app.use(cors());
 app.use(express.json());
 
 app.use("/api/v1/mutual-funds", mutualFundRoutes);
+// api/v1/mutual-funds?persist=1 
+// this endpoint is used to populate the database with initial mutual fund data
 
 if(process.env.ENABLE_NAV_CRON === '1') {
   startNavCron(app);
